@@ -23,6 +23,7 @@ import static java.lang.Thread.holdsLock;
 import static java.security.AccessController.doPrivileged;
 import static java.security.AccessController.getContext;
 import static java.util.concurrent.locks.LockSupport.*;
+import static org.jboss.threads.EnhancedQueueExecutor.*;
 
 import java.lang.management.ManagementFactory;
 import java.security.AccessControlContext;
@@ -53,7 +54,6 @@ import org.jboss.threads.management.ManageableThreadPoolExecutorService;
 import org.jboss.threads.management.StandardThreadPoolMXBean;
 import org.wildfly.common.Assert;
 import org.wildfly.common.annotation.NotNull;
-import sun.misc.Contended;
 
 /**
  * A task-or-thread queue backed thread pool executor service.  Tasks are added in a FIFO manner, and consumers in a LIFO manner.
@@ -67,8 +67,7 @@ import sun.misc.Contended;
  *
  * @author <a href="mailto:david.lloyd@redhat.com">David M. Lloyd</a>
  */
-@Contended
-public final class EnhancedQueueExecutor extends AbstractExecutorService implements ManageableThreadPoolExecutorService {
+public final class EnhancedQueueExecutor extends P4 implements ManageableThreadPoolExecutorService {
     static {
         Version.getVersionString();
     }
@@ -139,19 +138,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
      */
     static final boolean NO_QUEUE_LIMIT = readBooleanProperty("unlimited-queue", false);
     /**
-     * Establish a combined head/tail lock.
-     */
-    static final boolean COMBINED_LOCK = readBooleanProperty("combined-lock", false);
-    /**
-     * Attempt to lock frequently-contended operations on the list tail.  This defaults to {@code true} because
-     * moderate contention among 8 CPUs can result in thousands of spin misses per execution.
-     */
-    static final boolean TAIL_LOCK = COMBINED_LOCK || readBooleanProperty("tail-lock", true);
-    /**
-     * Attempt to lock frequently-contended operations on the list head.
-     */
-    static final boolean HEAD_LOCK = COMBINED_LOCK || readBooleanProperty("head-lock", true);
-    /**
      * Set the default value for whether an mbean is to be auto-registered for the thread pool.
      */
     static final boolean REGISTER_MBEAN = readBooleanProperty("register-mbean", true);
@@ -161,19 +147,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     // =======================================================
 
     static final Executor DEFAULT_HANDLER = JBossExecutors.rejectingExecutor();
-
-    // =======================================================
-    // Locks
-    // =======================================================
-
-    /**
-     * The tail lock.  Only used if {@link #TAIL_LOCK} is {@code true}.
-     */
-    final Object tailLock = new Object();
-    /**
-     * The head lock.  Only used if {@link #HEAD_LOCK} is {@code true}.
-     */
-    final Object headLock = COMBINED_LOCK ? tailLock : new Object();
 
     // =======================================================
     // Immutable configuration fields
@@ -203,22 +176,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     // =======================================================
     // Current state fields
     // =======================================================
-
-    /**
-     * The node <em>preceding</em> the head node; this field is not {@code null}.  This is
-     * the removal point for tasks (and the insertion point for waiting threads).
-     */
-    @NotNull
-    @SuppressWarnings("unused") // used by field updater
-    volatile TaskNode head;
-
-    /**
-     * The node <em>preceding</em> the tail node; this field is not {@code null}.  This
-     * is the insertion point for tasks (and the removal point for waiting threads).
-     */
-    @NotNull
-    @SuppressWarnings("unused") // used by field updater
-    volatile TaskNode tail;
 
     /**
      * Queue size:
@@ -291,7 +248,7 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     private final LongAdder submittedTaskCounter = new LongAdder();
     private final LongAdder completedTaskCounter = new LongAdder();
     private final LongAdder rejectedTaskCounter = new LongAdder();
-    private final LongAdder spinMisses = new LongAdder();
+    final LongAdder spinMisses = new LongAdder();
 
     /**
      * The current active number of threads.
@@ -302,9 +259,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     // =======================================================
     // Updaters
     // =======================================================
-
-    private static final AtomicReferenceFieldUpdater<EnhancedQueueExecutor, TaskNode> headUpdater = AtomicReferenceFieldUpdater.newUpdater(EnhancedQueueExecutor.class, TaskNode.class, "head");
-    private static final AtomicReferenceFieldUpdater<EnhancedQueueExecutor, TaskNode> tailUpdater = AtomicReferenceFieldUpdater.newUpdater(EnhancedQueueExecutor.class, TaskNode.class, "tail");
 
     private static final AtomicLongFieldUpdater<EnhancedQueueExecutor> queueSizeUpdater = AtomicLongFieldUpdater.newUpdater(EnhancedQueueExecutor.class, "queueSize");
     private static final AtomicLongFieldUpdater<EnhancedQueueExecutor> threadStatusUpdater = AtomicLongFieldUpdater.newUpdater(EnhancedQueueExecutor.class, "threadStatus");
@@ -372,7 +326,7 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
         threadStatus = withCoreSize(withMaxSize(withAllowCoreTimeout(0L, builder.allowsCoreThreadTimeOut()), maxSize), coreSize);
         timeoutNanos = max(1L, keepAliveTime);
         queueSize = withMaxQueueSize(withCurrentQueueSize(0L, 0), builder.getMaximumQueueSize());
-        mxBean = new MXBeanImpl();
+        mxBean = new MXBeanImpl(this);
         if (builder.isRegisterMBean()) {
             final String configuredName = builder.getMBeanName();
             final String finalName = configuredName != null ? configuredName : "threadpool-" + sequence.getAndIncrement();
@@ -1806,10 +1760,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
         return threadStatusUpdater.compareAndSet(this, expect, update);
     }
 
-    boolean compareAndSetHead(final TaskNode expect, final TaskNode update) {
-        return headUpdater.compareAndSet(this, expect, update);
-    }
-
     boolean compareAndSetPeakThreadCount(final int expect, final int update) {
         return peakThreadCountUpdater.compareAndSet(this, expect, update);
     }
@@ -1820,10 +1770,6 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
 
     boolean compareAndSetQueueSize(final long expect, final long update) {
         return queueSizeUpdater.compareAndSet(this, expect, update);
-    }
-
-    void compareAndSetTail(final TaskNode expect, final TaskNode update) {
-        tailUpdater.compareAndSet(this, expect, update);
     }
 
     // =======================================================
@@ -1954,7 +1900,7 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
     // Static configuration
     // =======================================================
 
-    private static boolean readBooleanProperty(String name, boolean defVal) {
+    static boolean readBooleanProperty(String name, boolean defVal) {
         return Boolean.parseBoolean(readProperty(name, Boolean.toString(defVal)));
     }
 
@@ -2032,241 +1978,342 @@ public final class EnhancedQueueExecutor extends AbstractExecutorService impleme
             throw t;
         }
     }
+}
+
+// =======================================================
+// Padding classes
+// =======================================================
+
+abstract class P1 extends AbstractExecutorService {
+    /**
+     * Attempt to lock frequently-contended operations on the list tail.  This defaults to {@code true} because
+     * moderate contention among 8 CPUs can result in thousands of spin misses per execution.
+     */
+    static final boolean TAIL_LOCK = COMBINED_LOCK || readBooleanProperty("tail-lock", true);
 
     // =======================================================
-    // Node classes
+    // Locks
     // =======================================================
 
-    @Contended
-    abstract static class QNode {
-        // in 9, use VarHandle
-        private static final AtomicReferenceFieldUpdater<QNode, QNode> nextUpdater = AtomicReferenceFieldUpdater.newUpdater(QNode.class, QNode.class, "next");
+    /**
+     * The tail lock.  Only used if {@link #TAIL_LOCK} is {@code true}.
+     */
+    final Object tailLock = new Object();
+    /**
+     * The node <em>preceding</em> the tail node; this field is not {@code null}.  This
+     * is the insertion point for tasks (and the removal point for waiting threads).
+     */
+    @NotNull
+    @SuppressWarnings("unused") // used by field updater
+    volatile TaskNode tail;
 
-        @SuppressWarnings("unused")
-        private volatile QNode next;
+    // =======================================================
+    // Updaters
+    // =======================================================
 
-        QNode(final QNode next) {
-            this.next = next;
-        }
+    private static final AtomicReferenceFieldUpdater<P1, TaskNode> tailUpdater = AtomicReferenceFieldUpdater.newUpdater(P1.class, TaskNode.class, "tail");
 
-        boolean compareAndSetNext(QNode expect, QNode update) {
-            return nextUpdater.compareAndSet(this, expect, update);
-        }
+    // =======================================================
+    // Compare-and-set operations
+    // =======================================================
 
-        QNode getNext() {
-            return nextUpdater.get(this);
-        }
+    void compareAndSetTail(final TaskNode expect, final TaskNode update) {
+        tailUpdater.compareAndSet(this, expect, update);
+    }
+}
 
-        QNode getAndSetNext(final QNode node) {
-            return nextUpdater.getAndSet(this, node);
-        }
+abstract class P2 extends P1 {
+    // Padding fields
+    @SuppressWarnings("unused")
+    int p00, p01, p02, p03,
+        p04, p05, p06, p07,
+        p08, p09, p0A, p0B,
+        p0C, p0D, p0E, p0F;
+}
+
+abstract class P3 extends P2 {
+    /**
+     * Establish a combined head/tail lock.
+     */
+    static final boolean COMBINED_LOCK = readBooleanProperty("combined-lock", false);
+    /**
+     * Attempt to lock frequently-contended operations on the list head.
+     */
+    static final boolean HEAD_LOCK = COMBINED_LOCK || readBooleanProperty("head-lock", true);
+
+    // =======================================================
+    // Locks
+    // =======================================================
+
+    /**
+     * The head lock.  Only used if {@link #HEAD_LOCK} is {@code true}.
+     */
+    final Object headLock = COMBINED_LOCK ? tailLock : new Object();
+
+    /**
+     * The node <em>preceding</em> the head node; this field is not {@code null}.  This is
+     * the removal point for tasks (and the insertion point for waiting threads).
+     */
+    @NotNull
+    @SuppressWarnings("unused") // used by field updater
+    volatile TaskNode head;
+
+    // =======================================================
+    // Updaters
+    // =======================================================
+
+    private static final AtomicReferenceFieldUpdater<P3, TaskNode> headUpdater = AtomicReferenceFieldUpdater.newUpdater(P3.class, TaskNode.class, "head");
+
+    // =======================================================
+    // Compare-and-set operations
+    // =======================================================
+
+    boolean compareAndSetHead(final TaskNode expect, final TaskNode update) {
+        return headUpdater.compareAndSet(this, expect, update);
+    }
+}
+
+abstract class P4 extends P3 {
+    // Padding fields
+    @SuppressWarnings("unused")
+    int p10, p11, p12, p13,
+        p14, p15, p16, p17,
+        p18, p19, p1A, p1B,
+        p1C, p1D, p1E, p1F;
+}
+
+// =======================================================
+// Node classes
+// =======================================================
+
+abstract class QNode {
+    // in 9, use VarHandle
+    private static final AtomicReferenceFieldUpdater<QNode, QNode> nextUpdater = AtomicReferenceFieldUpdater.newUpdater(QNode.class, QNode.class, "next");
+
+    @SuppressWarnings("unused")
+    private volatile QNode next;
+
+    QNode(final QNode next) {
+        this.next = next;
     }
 
-    @Contended
-    static final class PoolThreadNode extends QNode {
-        private final Thread thread;
+    boolean compareAndSetNext(QNode expect, QNode update) {
+        return nextUpdater.compareAndSet(this, expect, update);
+    }
 
-        @SuppressWarnings("unused")
-        private volatile Runnable task;
+    QNode getNext() {
+        return nextUpdater.get(this);
+    }
 
-        private static final AtomicReferenceFieldUpdater<PoolThreadNode, Runnable> taskUpdater = AtomicReferenceFieldUpdater.newUpdater(PoolThreadNode.class, Runnable.class, "task");
+    QNode getAndSetNext(final QNode node) {
+        return nextUpdater.getAndSet(this, node);
+    }
+}
 
-        PoolThreadNode(final PoolThreadNode next, final Thread thread) {
-            super(next);
-            this.thread = thread;
-            task = WAITING;
-        }
+final class PoolThreadNode extends QNode {
+    final Thread thread;
 
-        Thread getThread() {
+    @SuppressWarnings("unused")
+    private volatile Runnable task;
+
+    private static final AtomicReferenceFieldUpdater<PoolThreadNode, Runnable> taskUpdater = AtomicReferenceFieldUpdater.newUpdater(PoolThreadNode.class, Runnable.class, "task");
+
+    PoolThreadNode(final PoolThreadNode next, final Thread thread) {
+        super(next);
+        this.thread = thread;
+        task = WAITING;
+    }
+
+    Thread getThread() {
+        return thread;
+    }
+
+    boolean compareAndSetTask(final Runnable expect, final Runnable update) {
+        return taskUpdater.compareAndSet(this, expect, update);
+    }
+
+    Runnable getTask() {
+        return taskUpdater.get(this);
+    }
+
+    PoolThreadNode getNext() {
+        return (PoolThreadNode) super.getNext();
+    }
+}
+
+final class TerminateWaiterNode extends QNode {
+    private volatile Thread thread;
+
+    TerminateWaiterNode(final Thread thread) {
+        // always start with a {@code null} next
+        super(null);
+        this.thread = thread;
+    }
+
+    Thread getAndClearThread() {
+        // doesn't have to be particularly atomic
+        try {
             return thread;
-        }
-
-        boolean compareAndSetTask(final Runnable expect, final Runnable update) {
-            return taskUpdater.compareAndSet(this, expect, update);
-        }
-
-        Runnable getTask() {
-            return taskUpdater.get(this);
-        }
-
-        PoolThreadNode getNext() {
-            return (PoolThreadNode) super.getNext();
+        } finally {
+            thread = null;
         }
     }
 
-    @Contended
-    static final class TerminateWaiterNode extends QNode {
-        private volatile Thread thread;
+    TerminateWaiterNode getNext() {
+        return (TerminateWaiterNode) super.getNext();
+    }
+}
 
-        TerminateWaiterNode(final Thread thread) {
-            // always start with a {@code null} next
-            super(null);
-            this.thread = thread;
-        }
+final class TaskNode extends QNode {
+    volatile Runnable task;
 
-        Thread getAndClearThread() {
-            // doesn't have to be particularly atomic
-            try {
-                return thread;
-            } finally {
-                thread = null;
-            }
-        }
-
-        TerminateWaiterNode getNext() {
-            return (TerminateWaiterNode) super.getNext();
-        }
+    TaskNode(final Runnable task) {
+        // we always start task nodes with a {@code null} next
+        super(null);
+        this.task = task;
     }
 
-    @Contended
-    static final class TaskNode extends QNode {
-        volatile Runnable task;
-
-        TaskNode(final Runnable task) {
-            // we always start task nodes with a {@code null} next
-            super(null);
-            this.task = task;
-        }
-
-        Runnable getAndClearTask() {
-            try {
-                return task;
-            } finally {
-                this.task = null;
-            }
+    Runnable getAndClearTask() {
+        try {
+            return task;
+        } finally {
+            this.task = null;
         }
     }
+}
 
-    // =======================================================
-    // Management bean implementation
-    // =======================================================
+// =======================================================
+// Management bean implementation
+// =======================================================
 
-    final class MXBeanImpl implements StandardThreadPoolMXBean {
-        MXBeanImpl() {
-        }
+final class MXBeanImpl implements StandardThreadPoolMXBean {
+    private EnhancedQueueExecutor executor;
 
-        public float getGrowthResistance() {
-            return EnhancedQueueExecutor.this.getGrowthResistance();
-        }
+    MXBeanImpl(final EnhancedQueueExecutor executor) {
+        this.executor = executor;
+    }
 
-        public void setGrowthResistance(final float value) {
-            EnhancedQueueExecutor.this.setGrowthResistance(value);
-        }
+    public float getGrowthResistance() {
+        return executor.getGrowthResistance();
+    }
 
-        public boolean isGrowthResistanceSupported() {
-            return true;
-        }
+    public void setGrowthResistance(final float value) {
+        executor.setGrowthResistance(value);
+    }
 
-        public int getCorePoolSize() {
-            return EnhancedQueueExecutor.this.getCorePoolSize();
-        }
+    public boolean isGrowthResistanceSupported() {
+        return true;
+    }
 
-        public void setCorePoolSize(final int corePoolSize) {
-            EnhancedQueueExecutor.this.setCorePoolSize(corePoolSize);
-        }
+    public int getCorePoolSize() {
+        return executor.getCorePoolSize();
+    }
 
-        public boolean isCorePoolSizeSupported() {
-            return true;
-        }
+    public void setCorePoolSize(final int corePoolSize) {
+        executor.setCorePoolSize(corePoolSize);
+    }
 
-        public boolean prestartCoreThread() {
-            return EnhancedQueueExecutor.this.prestartCoreThread();
-        }
+    public boolean isCorePoolSizeSupported() {
+        return true;
+    }
 
-        public int prestartAllCoreThreads() {
-            return EnhancedQueueExecutor.this.prestartAllCoreThreads();
-        }
+    public boolean prestartCoreThread() {
+        return executor.prestartCoreThread();
+    }
 
-        public boolean isCoreThreadPrestartSupported() {
-            return true;
-        }
+    public int prestartAllCoreThreads() {
+        return executor.prestartAllCoreThreads();
+    }
 
-        public int getMaximumPoolSize() {
-            return EnhancedQueueExecutor.this.getMaximumPoolSize();
-        }
+    public boolean isCoreThreadPrestartSupported() {
+        return true;
+    }
 
-        public void setMaximumPoolSize(final int maxPoolSize) {
-            EnhancedQueueExecutor.this.setMaximumPoolSize(maxPoolSize);
-        }
+    public int getMaximumPoolSize() {
+        return executor.getMaximumPoolSize();
+    }
 
-        public int getPoolSize() {
-            return EnhancedQueueExecutor.this.getPoolSize();
-        }
+    public void setMaximumPoolSize(final int maxPoolSize) {
+        executor.setMaximumPoolSize(maxPoolSize);
+    }
 
-        public int getLargestPoolSize() {
-            return EnhancedQueueExecutor.this.getLargestPoolSize();
-        }
+    public int getPoolSize() {
+        return executor.getPoolSize();
+    }
 
-        public int getActiveCount() {
-            return EnhancedQueueExecutor.this.getActiveCount();
-        }
+    public int getLargestPoolSize() {
+        return executor.getLargestPoolSize();
+    }
 
-        public boolean isAllowCoreThreadTimeOut() {
-            return EnhancedQueueExecutor.this.allowsCoreThreadTimeOut();
-        }
+    public int getActiveCount() {
+        return executor.getActiveCount();
+    }
 
-        public void setAllowCoreThreadTimeOut(final boolean value) {
-            EnhancedQueueExecutor.this.allowCoreThreadTimeOut(value);
-        }
+    public boolean isAllowCoreThreadTimeOut() {
+        return executor.allowsCoreThreadTimeOut();
+    }
 
-        public long getKeepAliveTimeSeconds() {
-            return EnhancedQueueExecutor.this.getKeepAliveTime(TimeUnit.SECONDS);
-        }
+    public void setAllowCoreThreadTimeOut(final boolean value) {
+        executor.allowCoreThreadTimeOut(value);
+    }
 
-        public void setKeepAliveTimeSeconds(final long seconds) {
-            EnhancedQueueExecutor.this.setKeepAliveTime(seconds, TimeUnit.SECONDS);
-        }
+    public long getKeepAliveTimeSeconds() {
+        return executor.getKeepAliveTime(TimeUnit.SECONDS);
+    }
 
-        public int getMaximumQueueSize() {
-            return EnhancedQueueExecutor.this.getMaximumQueueSize();
-        }
+    public void setKeepAliveTimeSeconds(final long seconds) {
+        executor.setKeepAliveTime(seconds, TimeUnit.SECONDS);
+    }
 
-        public void setMaximumQueueSize(final int size) {
-            EnhancedQueueExecutor.this.setMaximumQueueSize(size);
-        }
+    public int getMaximumQueueSize() {
+        return executor.getMaximumQueueSize();
+    }
 
-        public int getQueueSize() {
-            return EnhancedQueueExecutor.this.getQueueSize();
-        }
+    public void setMaximumQueueSize(final int size) {
+        executor.setMaximumQueueSize(size);
+    }
 
-        public int getLargestQueueSize() {
-            return EnhancedQueueExecutor.this.getLargestQueueSize();
-        }
+    public int getQueueSize() {
+        return executor.getQueueSize();
+    }
 
-        public boolean isQueueBounded() {
-            return ! NO_QUEUE_LIMIT;
-        }
+    public int getLargestQueueSize() {
+        return executor.getLargestQueueSize();
+    }
 
-        public boolean isQueueSizeModifiable() {
-            return ! NO_QUEUE_LIMIT;
-        }
+    public boolean isQueueBounded() {
+        return ! NO_QUEUE_LIMIT;
+    }
 
-        public boolean isShutdown() {
-            return EnhancedQueueExecutor.this.isShutdown();
-        }
+    public boolean isQueueSizeModifiable() {
+        return ! NO_QUEUE_LIMIT;
+    }
 
-        public boolean isTerminating() {
-            return EnhancedQueueExecutor.this.isTerminating();
-        }
+    public boolean isShutdown() {
+        return executor.isShutdown();
+    }
 
-        public boolean isTerminated() {
-            return EnhancedQueueExecutor.this.isTerminated();
-        }
+    public boolean isTerminating() {
+        return executor.isTerminating();
+    }
 
-        public long getSubmittedTaskCount() {
-            return EnhancedQueueExecutor.this.getSubmittedTaskCount();
-        }
+    public boolean isTerminated() {
+        return executor.isTerminated();
+    }
 
-        public long getRejectedTaskCount() {
-            return EnhancedQueueExecutor.this.getRejectedTaskCount();
-        }
+    public long getSubmittedTaskCount() {
+        return executor.getSubmittedTaskCount();
+    }
 
-        public long getCompletedTaskCount() {
-            return EnhancedQueueExecutor.this.getCompletedTaskCount();
-        }
+    public long getRejectedTaskCount() {
+        return executor.getRejectedTaskCount();
+    }
 
-        public long getSpinMissCount() {
-            return EnhancedQueueExecutor.this.spinMisses.longValue();
-        }
+    public long getCompletedTaskCount() {
+        return executor.getCompletedTaskCount();
+    }
+
+    public long getSpinMissCount() {
+        return executor.spinMisses.longValue();
     }
 }
